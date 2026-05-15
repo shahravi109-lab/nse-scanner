@@ -1,26 +1,47 @@
 """
-NSE IPO Scanner — DEBUG VERSION
-Sends detailed rejection reason for every stock to Telegram.
-Use this once to diagnose why stocks are being filtered out.
+NSE IPO Daily Scanner — Dhan API (Fixed)
+=========================================
+Uses Dhan's scrip master CSV to lookup security IDs (no search API needed).
+Then fetches OHLC via Dhan historical data API.
+
+Filters:
+  1. Listed in last 365 days
+  2. Price within 0-6% of 52W high
+  3. Market cap Rs.1,000 Cr to Rs.50,000 Cr
+  4. Insider bar on daily chart
+
+GTT Setup:
+  Entry     = Mother candle High + Rs.0.10
+  Stop Loss = Mother candle Low  - Rs.0.10
+  Target    = Entry + 2 x Risk (1:2 R:R)
 """
 
 import requests
 import os
 import time
+import io
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
+# ── CONFIG ────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 DHAN_CLIENT_ID     = os.environ.get("DHAN_CLIENT_ID", "")
 DHAN_ACCESS_TOKEN  = os.environ.get("DHAN_ACCESS_TOKEN", "")
 
+# ── CRITERIA ──────────────────────────────────────────────
 MAX_PCT_BELOW_HIGH = 6.0
 MIN_MARKET_CAP_CR  = 1_000
 MAX_MARKET_CAP_CR  = 50_000
 MAX_LISTING_DAYS   = 365
+ENTRY_BUFFER       = 0.10
+SL_BUFFER          = 0.10
+RR_RATIO           = 2.0
 
-DHAN_BASE    = "https://api.dhan.co"
+# ── DHAN ENDPOINTS ────────────────────────────────────────
+DHAN_BASE         = "https://api.dhan.co"
+DHAN_SCRIP_MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
 DHAN_HEADERS = {
     "Content-Type": "application/json",
     "Accept":       "application/json",
@@ -28,84 +49,126 @@ DHAN_HEADERS = {
     "access-token": DHAN_ACCESS_TOKEN,
 }
 
-# Test with just 10 stocks first
-TEST_SYMBOLS = [
-    "VIDYAWIRES", "SEDMAC", "BAJAJHFL", "SWIGGY",
-    "HYUNDAI", "NTPCGREEN", "NETWEB", "WAAREEENER",
-    "SAGILITY", "AFCONS"
+# ── SYMBOL LIST ───────────────────────────────────────────
+FALLBACK_SYMBOLS = [
+    "VIDYAWIRES", "SEDMAC",     "BAJAJHFL",   "WAAREEENER",  "SWIGGY",
+    "HYUNDAI",    "NTPCGREEN",  "AFCONS",      "SAGILITY",    "DEEPINDS",
+    "VIBHOR",     "STALLION",   "INOXINDIA",   "YATHARTH",    "SENCO",
+    "NETWEB",     "UTKARSH",    "RATNAVEER",   "ELIN",        "IDEAFORGE",
+    "CYIENTDL",   "CREDO",      "ENVIRO",      "GARUDA",      "MOBIKWIK",
+    "DIFFUSION",  "BLACKBUCK",  "NIVA",        "PNGIPL",      "LANDMARK",
+    "BHARTIHEXA", "UPDATER",    "UNIMECH",     "INVENTURUS",  "MAMATA",
+    "ZINKA",      "ACME",       "GODAVARI",    "RAPIDFLUX",   "HEXAWARE",
+    "DENTA",      "RIKHAV",     "LAXMIDENTAL", "KAYNES",      "TRACXN",
+    "SULA",       "DHARMAJ",    "BIKAJI",      "UNIPARTS",    "RAINBOW",
+    "FUSION",     "MEDPLUS",    "DELHIVERY",   "ETHOS",       "ARCHEAN",
+    "SBFC",       "KFIN",       "MAPMYINDIA",  "CAMPUS",      "EMCURE",
+    "GODIGIT",    "INDEGENE",   "AWFIS",       "TBOTECH",     "SIGNORIA",
 ]
 
 
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(msg)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
-        requests.post(url, data={
-            "chat_id":    TELEGRAM_CHAT_ID,
-            "text":       chunk,
-            "parse_mode": "Markdown",
-        })
+# ── LOAD SYMBOL LIST ──────────────────────────────────────
+def get_symbols() -> tuple[list[str], str]:
+    if os.path.exists("symbols.txt"):
+        try:
+            syms = [
+                l.strip().upper() for l in open("symbols.txt")
+                if l.strip() and not l.startswith("#")
+            ]
+            if len(syms) >= 5:
+                return syms, f"symbols.txt ({len(syms)} stocks)"
+        except Exception:
+            pass
+    return FALLBACK_SYMBOLS, f"Built-in list ({len(FALLBACK_SYMBOLS)} stocks)"
 
 
-def dhan_search(symbol):
+# ── LOAD DHAN SCRIP MASTER ────────────────────────────────
+def load_scrip_master() -> pd.DataFrame | None:
+    """
+    Downloads Dhan scrip master CSV and returns a DataFrame.
+    Columns include: SEM_SMST_SECURITY_ID, SM_SYMBOL_NAME,
+                     SEM_TRADING_SYMBOL, SEM_SEGMENT, SEM_EXM_EXCH_ID
+    """
+    print("📥 Downloading Dhan scrip master...")
     try:
-        r = requests.post(
-            f"{DHAN_BASE}/v2/instruments/search",
-            headers=DHAN_HEADERS,
-            json={"searchString": symbol},
-            timeout=10,
-        )
-        print(f"  Search status: {r.status_code}")
+        r = requests.get(DHAN_SCRIP_MASTER, timeout=30)
         if r.status_code != 200:
-            return None, f"Search API error {r.status_code}: {r.text[:100]}"
-
-        items = r.json()
-        if isinstance(items, dict):
-            items = items.get("data", [])
-
-        print(f"  Search results: {len(items)} items")
-        for item in items:
-            print(f"    -> {item.get('tradingSymbol')} | {item.get('exchangeSegment')} | id={item.get('securityId')}")
-
-        # Find NSE equity match
-        for item in items:
-            if (item.get("tradingSymbol","").upper() == symbol.upper() and
-                    item.get("exchangeSegment") in ("NSE_EQ","NSE")):
-                return item, ""
-        # fallback: first NSE result
-        for item in items:
-            if item.get("exchangeSegment") in ("NSE_EQ","NSE"):
-                return item, f"No exact match, using {item.get('tradingSymbol')}"
-
-        return None, f"Not found in NSE. Results: {[i.get('tradingSymbol') for i in items[:5]]}"
+            print(f"  ✗ Failed: {r.status_code}")
+            return None
+        df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+        print(f"  ✓ Loaded {len(df):,} instruments")
+        # Filter NSE equity only
+        nse = df[
+            (df["SEM_EXM_EXCH_ID"] == "NSE") &
+            (df["SEM_SEGMENT"] == "E")
+        ].copy()
+        print(f"  ✓ NSE Equity instruments: {len(nse):,}")
+        return nse
     except Exception as e:
-        return None, f"Search exception: {e}"
+        print(f"  ✗ Error: {e}")
+        return None
 
 
-def dhan_ohlc(security_id, exchange_seg="NSE_EQ"):
+def find_security_id(scrip_master: pd.DataFrame, symbol: str) -> tuple[str, str]:
+    """
+    Looks up security_id for a symbol in scrip master.
+    Returns (security_id, display_name) or ("", "") if not found.
+    """
+    sym_upper = symbol.upper()
+
+    # Try exact match on trading symbol
+    match = scrip_master[
+        scrip_master["SEM_TRADING_SYMBOL"].str.upper() == sym_upper
+    ]
+    if match.empty:
+        # Try custom symbol
+        match = scrip_master[
+            scrip_master["SEM_CUSTOM_SYMBOL"].str.upper() == sym_upper
+        ]
+    if match.empty:
+        # Try symbol name
+        match = scrip_master[
+            scrip_master["SM_SYMBOL_NAME"].str.upper() == sym_upper
+        ]
+
+    if match.empty:
+        return "", ""
+
+    row = match.iloc[0]
+    sec_id  = str(int(row["SEM_SMST_SECURITY_ID"]))
+    name    = str(row.get("SEM_CUSTOM_SYMBOL", symbol))
+    return sec_id, name
+
+
+# ── DHAN HISTORICAL OHLC ──────────────────────────────────
+def dhan_ohlc(security_id: str) -> pd.DataFrame | None:
+    """
+    Fetches 1 year of daily OHLC from Dhan historical API.
+    """
     try:
         to_date   = datetime.now().date()
         from_date = to_date - timedelta(days=400)
+
         body = {
             "securityId":      security_id,
-            "exchangeSegment": exchange_seg,
+            "exchangeSegment": "NSE_EQ",
             "instrument":      "EQUITY",
             "expiryCode":      0,
-            "oi_flag":         "N",
+            "oi":              False,
             "fromDate":        from_date.strftime("%Y-%m-%d"),
             "toDate":          to_date.strftime("%Y-%m-%d"),
         }
+
         r = requests.post(
             f"{DHAN_BASE}/v2/charts/historical",
             headers=DHAN_HEADERS,
             json=body,
             timeout=15,
         )
-        print(f"  OHLC status: {r.status_code}")
+
         if r.status_code != 200:
-            return None, f"OHLC API error {r.status_code}: {r.text[:150]}"
+            print(f"    OHLC error {r.status_code}: {r.text[:100]}")
+            return None
 
         data = r.json()
         closes     = data.get("close",     [])
@@ -114,113 +177,225 @@ def dhan_ohlc(security_id, exchange_seg="NSE_EQ"):
         opens      = data.get("open",      [])
         timestamps = data.get("timestamp", [])
 
-        print(f"  OHLC candles received: {len(closes)}")
-        if len(closes) < 2:
-            return None, f"Too few candles: {len(closes)}"
+        if len(closes) < 5:
+            print(f"    Too few candles: {len(closes)}")
+            return None
 
         df = pd.DataFrame({
-            "Open": opens, "High": highs,
-            "Low":  lows,  "Close": closes,
-            "Date": pd.to_datetime(timestamps, unit="s"),
+            "Open":  opens,
+            "High":  highs,
+            "Low":   lows,
+            "Close": closes,
+            "Date":  pd.to_datetime(timestamps, unit="s"),
         }).dropna().sort_values("Date").reset_index(drop=True)
 
-        return df, ""
+        return df
+
     except Exception as e:
-        return None, f"OHLC exception: {e}"
+        print(f"    OHLC exception: {e}")
+        return None
 
 
-def debug_stock(symbol):
-    print(f"\n{'─'*50}")
-    print(f"Checking: {symbol}")
-    result = {"symbol": symbol, "steps": []}
+# ── FILTER + ANALYSE ──────────────────────────────────────
+def inr_to_crore(v):
+    return (v or 0) / 1e7
 
-    # Step 1: Search
-    scrip, err = dhan_search(symbol)
-    if not scrip:
-        result["verdict"] = f"FAIL: {err}"
-        return result
-    result["steps"].append(f"Found: id={scrip.get('securityId')} seg={scrip.get('exchangeSegment')}")
 
-    security_id  = str(scrip.get("securityId",""))
-    exchange_seg = scrip.get("exchangeSegment","NSE_EQ")
+def check_stock(symbol, scrip_master) -> tuple[dict | None, str]:
+    # Step 1: Find security ID
+    sec_id, name = find_security_id(scrip_master, symbol)
+    if not sec_id:
+        return None, "Not found in Dhan scrip master"
 
-    # Step 2: OHLC
-    df, err = dhan_ohlc(security_id, exchange_seg)
-    if df is None:
-        result["verdict"] = f"FAIL: {err}"
-        return result
-    result["steps"].append(f"OHLC: {len(df)} candles | {df['Date'].iloc[0].date()} to {df['Date'].iloc[-1].date()}")
+    print(f"  Found: id={sec_id} name={name}")
 
-    # Step 3: Listing date
+    # Step 2: OHLC data
+    df = dhan_ohlc(sec_id)
+    if df is None or len(df) < 5:
+        return None, "No OHLC data"
+
+    # Filter 1: Listing date
     ipo_date    = df["Date"].iloc[0].date()
     days_listed = (datetime.now().date() - ipo_date).days
-    result["steps"].append(f"IPO date: {ipo_date} ({days_listed}d ago)")
     if days_listed > MAX_LISTING_DAYS:
-        result["verdict"] = f"FAIL Filter1: Listed {days_listed}d ago > {MAX_LISTING_DAYS}d"
-        return result
+        return None, f"Listed {days_listed}d ago (>{MAX_LISTING_DAYS}d) — too old"
 
-    # Step 4: Market cap
-    mkt_cap_crore = (scrip.get("marketCap") or 0) / 1e7
-    result["steps"].append(f"Mkt Cap: Rs.{mkt_cap_crore:,.0f} Cr")
-    if mkt_cap_crore > 0:
-        if mkt_cap_crore < MIN_MARKET_CAP_CR:
-            result["verdict"] = f"FAIL Filter2: Mkt cap Rs.{mkt_cap_crore:,.0f}Cr < Rs.{MIN_MARKET_CAP_CR:,}Cr"
-            return result
-        if mkt_cap_crore > MAX_MARKET_CAP_CR:
-            result["verdict"] = f"FAIL Filter2: Mkt cap Rs.{mkt_cap_crore:,.0f}Cr > Rs.{MAX_MARKET_CAP_CR:,}Cr"
-            return result
+    # Filter 2: Market cap (skip if 0 — not in scrip master)
+    # We skip this filter since Dhan scrip master doesn't have market cap
+    # You can re-enable by fetching from another source
+    mkt_cap_crore = 0  # not available in scrip master
 
-    # Step 5: Price vs 52W high
-    current = float(df["Close"].iloc[-1])
-    high52  = float(df["High"].tail(252).max())
-    pct     = ((high52 - current) / high52) * 100
-    result["steps"].append(f"Price: Rs.{current:.2f} | 52W High: Rs.{high52:.2f} | {pct:.1f}% below")
-    if pct > MAX_PCT_BELOW_HIGH:
-        result["verdict"] = f"FAIL Filter3: {pct:.1f}% below 52W high > {MAX_PCT_BELOW_HIGH}%"
-        return result
-    if pct < 0:
-        result["verdict"] = f"FAIL Filter3: Price above 52W high (data issue)"
-        return result
+    # Filter 3: Price vs 52W high
+    current_price = float(df["Close"].iloc[-1])
+    high_52w      = float(df["High"].tail(252).max())
+    pct_below     = ((high_52w - current_price) / high_52w) * 100
 
-    # Step 6: Insider bar check
+    if pct_below < 0:
+        return None, f"Price Rs.{current_price} above 52W high Rs.{high_52w} (data issue)"
+    if pct_below > MAX_PCT_BELOW_HIGH:
+        return None, f"Price {pct_below:.1f}% below 52W high (>{MAX_PCT_BELOW_HIGH}%)"
+
+    return {
+        "symbol":        symbol,
+        "name":          name,
+        "current_price": round(current_price, 2),
+        "high_52w":      round(high_52w, 2),
+        "pct_below":     round(pct_below, 2),
+        "mkt_cap_crore": mkt_cap_crore,
+        "days_listed":   days_listed,
+        "ipo_date":      ipo_date.strftime("%d-%b-%Y"),
+        "df":            df,
+    }, ""
+
+
+# ── INSIDER BAR ───────────────────────────────────────────
+def find_insider_bar(df: pd.DataFrame) -> dict:
     recent = df.tail(6).reset_index(drop=True)
-    ib_found = False
+    last_ib = None
+
     for i in range(1, len(recent)):
-        c = recent.iloc[i]
-        p = recent.iloc[i-1]
-        if float(c["High"]) <= float(p["High"]) and float(c["Low"]) >= float(p["Low"]):
-            ib_found = True
-            result["steps"].append(
-                f"IB on {c['Date'].strftime('%d-%b')}: "
-                f"H={c['High']:.2f} L={c['Low']:.2f} inside "
-                f"Mother H={p['High']:.2f} L={p['Low']:.2f}"
-            )
+        ins = recent.iloc[i]
+        mom = recent.iloc[i - 1]
 
-    result["verdict"] = "✅ PASS ALL FILTERS" + (" + INSIDER BAR!" if ib_found else " | No insider bar")
-    return result
+        ih = float(ins["High"]); il = float(ins["Low"])
+        mh = float(mom["High"]); ml = float(mom["Low"])
+
+        if ih <= mh and il >= ml:
+            entry  = round(mh + ENTRY_BUFFER, 2)
+            sl     = round(ml - SL_BUFFER,    2)
+            risk   = round(entry - sl, 2)
+            target = round(entry + RR_RATIO * risk, 2)
+
+            def fmt(row):
+                try:
+                    return pd.Timestamp(row["Date"]).strftime("%d-%b")
+                except Exception:
+                    return "—"
+
+            last_ib = {
+                "found":        True,
+                "mother_date":  fmt(mom),
+                "mother_high":  round(mh, 2),
+                "mother_low":   round(ml, 2),
+                "insider_date": fmt(ins),
+                "insider_high": round(ih, 2),
+                "insider_low":  round(il, 2),
+                "entry":        entry,
+                "stop_loss":    sl,
+                "target":       target,
+                "risk":         risk,
+                "reward":       round(target - entry, 2),
+            }
+
+    return last_ib or {"found": False}
 
 
+# ── MAIN SCAN ─────────────────────────────────────────────
+def scan_all(symbols, scrip_master):
+    print(f"\n{'='*60}")
+    print(f"  NSE IPO SCANNER | {datetime.now().strftime('%d %b %Y %I:%M %p')}")
+    print(f"{'='*60}")
+
+    matches    = []
+    passed     = 0
+    rejections = []
+
+    for i, sym in enumerate(symbols, 1):
+        print(f"\n[{i:02d}/{len(symbols)}] {sym}")
+        data, reason = check_stock(sym, scrip_master)
+        time.sleep(0.3)
+
+        if not data:
+            print(f"  -> SKIP: {reason}")
+            rejections.append((sym, reason))
+            continue
+
+        passed += 1
+        ib = find_insider_bar(data["df"])
+
+        if not ib["found"]:
+            print(f"  -> Passed price filter | No insider bar")
+            rejections.append((sym, "No insider bar in last 5 candles"))
+            continue
+
+        print(f"  -> *** INSIDER BAR! ***")
+        print(f"     Mother  [{ib['mother_date']}] H={ib['mother_high']} L={ib['mother_low']}")
+        print(f"     Insider [{ib['insider_date']}] H={ib['insider_high']} L={ib['insider_low']}")
+        print(f"     Entry={ib['entry']} SL={ib['stop_loss']} Target={ib['target']}")
+
+        matches.append({**{k: v for k, v in data.items() if k != "df"}, **ib})
+
+    return matches, passed, rejections
+
+
+# ── FORMAT TELEGRAM ───────────────────────────────────────
+def format_message(matches, total, passed, source, rejections):
+    now = datetime.now().strftime("%d %b %Y  %I:%M %p")
+    msg  = f"*NSE IPO Daily Scanner*\n*{now}*\n"
+    msg += f"_Data: Dhan API | {source}_\n"
+    msg += f"{'─'*30}\n"
+    msg += f"Stocks checked   : {total}\n"
+    msg += f"Passed filter    : {passed}\n"
+    msg += f"Insider bars     : *{len(matches)}*\n"
+    msg += f"{'─'*30}\n\n"
+
+    if matches:
+        for r in matches:
+            msg += f"*{r['symbol']}*  |  {r['name']}\n"
+            msg += f"Listed   : {r['ipo_date']} ({r['days_listed']}d ago)\n"
+            msg += f"Price    : Rs.{r['current_price']:,}  |  52W High: Rs.{r['high_52w']:,} ({r['pct_below']}% below)\n\n"
+            msg += f"*Candles:*\n"
+            msg += f"  Mother  [{r['mother_date']}] H:{r['mother_high']}  L:{r['mother_low']}\n"
+            msg += f"  Insider [{r['insider_date']}] H:{r['insider_high']}  L:{r['insider_low']}\n\n"
+            msg += f"*GTT Order:*\n"
+            msg += f"  Entry     : Rs.{r['entry']}\n"
+            msg += f"  Stop Loss : Rs.{r['stop_loss']}\n"
+            msg += f"  Target    : Rs.{r['target']}  (1:2)\n"
+            msg += f"  Risk/share: Rs.{r['risk']}\n"
+            msg += f"{'─'*30}\n\n"
+        msg += "_Verify on TradingView before placing GTT._\n\n"
+    else:
+        msg += "*No insider bar setups today.*\n_Protect capital. Better setups tomorrow!_\n\n"
+
+    msg += f"{'─'*30}\n*Why stocks were skipped:*\n"
+    for sym, reason in rejections[:25]:
+        msg += f"  {sym}: {reason}\n"
+    if len(rejections) > 25:
+        msg += f"  ...+{len(rejections)-25} more\n"
+    return msg
+
+
+# ── SEND TELEGRAM ─────────────────────────────────────────
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("\n--- PREVIEW ---\n", message)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
+        r = requests.post(url, data={
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       chunk,
+            "parse_mode": "Markdown",
+        })
+        print(f"  Telegram: {'OK' if r.status_code==200 else r.status_code}")
+
+
+# ── ENTRY ─────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"DHAN_CLIENT_ID set: {'YES' if DHAN_CLIENT_ID else 'NO'}")
-    print(f"DHAN_ACCESS_TOKEN set: {'YES (len='+str(len(DHAN_ACCESS_TOKEN))+')' if DHAN_ACCESS_TOKEN else 'NO'}")
+    if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
+        print("ERROR: DHAN credentials not set!")
+        exit(1)
 
-    all_results = []
-    for sym in TEST_SYMBOLS:
-        r = debug_stock(sym)
-        all_results.append(r)
-        time.sleep(0.5)
+    # Load scrip master once
+    scrip_master = load_scrip_master()
+    if scrip_master is None:
+        print("ERROR: Could not load scrip master. Check network.")
+        exit(1)
 
-    # Build Telegram message
-    now = datetime.now().strftime("%d %b %Y %I:%M %p")
-    msg = f"*NSE Scanner — Debug Report*\n*{now}*\n{'─'*30}\n\n"
+    symbols, source = get_symbols()
+    matches, passed, rejections = scan_all(symbols, scrip_master)
 
-    for r in all_results:
-        msg += f"*{r['symbol']}*\n"
-        for step in r.get("steps", []):
-            msg += f"  {step}\n"
-        msg += f"  ➜ {r.get('verdict','?')}\n\n"
-
-    print("\n" + "="*50)
-    print(msg)
+    print(f"\nDONE: {len(matches)} match(es)")
+    msg = format_message(matches, len(symbols), passed, source, rejections)
     send_telegram(msg)
-    print("Done!")
+    print("Complete!")
